@@ -198,15 +198,12 @@ func (r *CRDiscoverer) PollForCacheUpdates(
 	ctx context.Context,
 	opts *options.Options,
 	storeBuilder *store.Builder,
-	m *metricshandler.MetricsHandler,
+	metricsHandler *metricshandler.MetricsHandler,
 	factoryGenerator func() ([]customresource.RegistryFactory, error),
-) {
+) error {
 	// The interval at which we will check the cache for updates.
 	t := time.NewTicker(Interval)
-	// Track previous context to allow refreshing cache.
-	olderContext, olderCancel := context.WithCancel(ctx)
-	// Prevent context leak (kill the last metric handler instance).
-	defer olderCancel()
+
 	generateMetrics := func() {
 		// Get families for discovered factories.
 		customFactories, err := factoryGenerator()
@@ -239,21 +236,7 @@ func (r *CRDiscoverer) PollForCacheUpdates(
 		r.SafeWrite(func() {
 			r.WasUpdated = false
 		})
-		// Run the metrics handler with updated configs.
-		olderContext, olderCancel = context.WithCancel(ctx)
-		go func() {
-			// Blocks indefinitely until the unbuffered context is cancelled to serve metrics for that duration.
-			err = m.Run(olderContext)
-			if err != nil {
-				// Check if context was cancelled.
-				select {
-				case <-olderContext.Done():
-					// Context cancelled, don't really need to log this though.
-				default:
-					klog.ErrorS(err, "failed to run metrics handler")
-				}
-			}
-		}()
+		metricsHandler.Refresh(storeBuilder)
 	}
 	go func() {
 		for range t.C {
@@ -269,11 +252,13 @@ func (r *CRDiscoverer) PollForCacheUpdates(
 					shouldGenerateMetrics = r.WasUpdated
 				})
 				if shouldGenerateMetrics {
-					olderCancel()
 					generateMetrics()
 					klog.InfoS("discovery finished, cache updated")
 				}
 			}
 		}
 	}()
+
+	<-ctx.Done()
+	return ctx.Err()
 }

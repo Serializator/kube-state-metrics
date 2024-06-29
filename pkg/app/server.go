@@ -21,6 +21,7 @@ import (
 	"crypto/md5" //nolint:gosec
 	"encoding/binary"
 	"fmt"
+	"k8s.io/kube-state-metrics/v2/pkg/sharding"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -268,49 +269,60 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 
 	var g run.Group
 
-	m := metricshandler.New(
+	metricsHandler := metricshandler.New(
+		opts.EnableGZIPEncoding,
+	)
+
+	shardingHandler := sharding.NewHandler(
 		opts,
 		kubeClient,
 		storeBuilder,
-		opts.EnableGZIPEncoding,
+		metricsHandler,
 	)
-	// Run MetricsHandler
-	if config == nil {
-		ctxMetricsHandler, cancel := context.WithCancel(ctx)
-		g.Add(func() error {
-			return m.Run(ctxMetricsHandler)
-		}, func(error) {
-			cancel()
-		})
-	}
+
+	// Run sharding handler
+	ctxShardingHandler, cancelShardingHandler := context.WithCancel(ctx)
+	g.Add(func() error {
+		return shardingHandler.Run(ctxShardingHandler)
+	}, func(error) {
+		cancelShardingHandler()
+	})
 
 	tlsConfig := opts.TLSConfig
 
 	// A nil CRS config implies that we need to hold off on all CRS operations.
 	if config != nil {
+		ctxCRDDiscovered, cancelCRDDiscoverer := context.WithCancel(ctx)
+
 		discovererInstance := &discovery.CRDiscoverer{
 			CRDsAddEventsCounter:    crdsAddEventsCounter,
 			CRDsDeleteEventsCounter: crdsDeleteEventsCounter,
 			CRDsCacheCountGauge:     crdsCacheCountGauge,
 		}
 		// This starts a goroutine that will watch for any new GVKs to extract from CRDs.
-		err = discovererInstance.StartDiscovery(ctx, kubeConfig)
+		err = discovererInstance.StartDiscovery(ctxCRDDiscovered, kubeConfig)
 		if err != nil {
+			cancelCRDDiscoverer()
 			return err
 		}
 		// FromConfig will return different behaviours when a G**-based config is supplied (since that is subject to change based on the resources present in the cluster).
 		fn, err := customresourcestate.FromConfig(config, discovererInstance)
 		if err != nil {
+			cancelCRDDiscoverer()
 			return err
 		}
 		// This starts a goroutine that will keep the cache up to date.
-		discovererInstance.PollForCacheUpdates(
-			ctx,
-			opts,
-			storeBuilder,
-			m,
-			fn,
-		)
+		g.Add(func() error {
+			return discovererInstance.PollForCacheUpdates(
+				ctx,
+				opts,
+				storeBuilder,
+				metricsHandler,
+				fn,
+			)
+		}, func(err error) {
+			cancelCRDDiscoverer()
+		})
 	}
 
 	telemetryMux := buildTelemetryServer(ksmMetricsRegistry)
@@ -324,7 +336,7 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 		WebConfigFile:      &tlsConfig,
 	}
 
-	metricsMux := buildMetricsServer(m, durationVec, kubeClient)
+	metricsMux := buildMetricsServer(metricsHandler, durationVec, kubeClient)
 	metricsServerListenAddress := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
 	metricsServer := http.Server{
 		Handler:           metricsMux,
@@ -396,7 +408,7 @@ func buildTelemetryServer(registry prometheus.Gatherer) *http.ServeMux {
 	return mux
 }
 
-func buildMetricsServer(m *metricshandler.MetricsHandler, durationObserver prometheus.ObserverVec, client kubernetes.Interface) *http.ServeMux {
+func buildMetricsServer(m http.Handler, durationObserver prometheus.ObserverVec, client kubernetes.Interface) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// TODO: This doesn't belong into serveMetrics
